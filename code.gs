@@ -17,9 +17,10 @@
  *   (+ meta, settings created if missing)
  * Snapshots: "YYYYMMDD data", "YYYYMMDD data_years"
  *
- * Year-series Source codes: Dm (demand/capacity/timeline), Alc (allocation),
+ * Year-series Source codes: Dm (demand), availability, timeline, Alc (allocation),
  *   Emp (employee). Legacy Bud month series is superseded by the budget tab.
- *   Legacy Sc / M1–M12 headers still read.
+ *   Older sheets stored availability and timeline as Dm; those values are still
+ *   read and rewritten to availability / timeline. Legacy Sc / M1–M12 headers still read.
  */
 
 /** Production Cap Plan spreadsheet (edit ID only if the databank moves). */
@@ -27,10 +28,18 @@ var DATABANK_ID = '1aeaPWGQghoXC__bmEwsgU7203rxzg5jRQz5CN_IInTI';
 
 /** External activity log (load / save / notify). Script owner must have edit access. */
 var LOGGER_SHEET_ID = '1RnzfCWrxc1adpgXa3M6JX3pL7MfPXC6_YDFD0Rn34S8';
+/** Legacy single-tab name (still scanned for email directory). */
 var LOGGER_TAB = 'Logger';
 var LOGGER_HEADERS = ['Timestamp', 'Event', 'User Name', 'Role', 'Email', 'Details'];
+/** Event → Activity Logger workbook tab (load+reload share Load). */
+var LOGGER_EVENT_TABS = {
+  load: 'Load',
+  reload: 'Load',
+  notify: 'Notify',
+  save: 'Save'
+};
 /** Tabs scanned for name→email (Activity Logger workbook). */
-var EMAIL_DIR_TABS = ['Contacts', 'Activity_Logger', 'Logger'];
+var EMAIL_DIR_TABS = ['Contacts', 'Activity_Logger', 'Logger', 'Load', 'Notify', 'Save'];
 var CONTACTS_HEADERS = ['User Name', 'Email', 'Updated'];
 
 var SHEETS = {
@@ -43,8 +52,20 @@ var SHEETS = {
   ACCESS: 'Access',
   COST_CENTERS: 'cost center information',
   BUDGET: 'budget',
-  BOOKING: 'booking'
+  BOOKING: 'booking',
+  OVERVIEW_VIEWS: 'Overview views',
+  FEEDBACK: 'Feedback'
 };
+
+var FEEDBACK_HEADERS = [
+  'Feedback_ID', 'User', 'Date/Time', 'Type', 'Description', 'Status', 'Reply', 'Row_ID'
+];
+var FEEDBACK_TYPES = ['Feedback', 'Bug Report', 'Request'];
+var FEEDBACK_STATUSES = ['New', 'In Clarification', 'Planned', 'Cancelled', 'Completed'];
+
+var OVERVIEW_VIEW_HEADERS = [
+  'View_ID', 'Name', 'Scope', 'Owner', 'ViewMode', 'Payload', 'SavedAt'
+];
 
 /** 1 FTE = 133 hours for SAP transfer conversion. */
 var FTE_HOURS = 133;
@@ -108,16 +129,21 @@ var PROJECT_HEADERS = [
 ];
 
 var EMPLOYEE_HEADERS = [
-  'Employee_ID', 'Role', 'Name', 'Comments', 'People Location', 'Group', 'FTE Type'
+  'Employee_ID', 'Role', 'Name', 'Comments', 'People Location', 'Group', 'FTE Type',
+  'Emp writes Alloc'
 ];
 
-/** Hierarchy cost-center attribution (most-specific level wins per field). */
+/**
+ * Cost Centers tab (flat hierarchy columns — one decisive level filled per row).
+ * Legacy sheets with Level / Level Value are still readable.
+ */
 var COST_CENTER_HEADERS = [
-  'CC_ID', 'Level', 'Level Value',
-  'Internal Cost Center', 'Internal Activity Type',
+  'CC_ID', 'Unit', 'Department', 'Group', 'Role', 'Name', 'Location',
+  'Internal Cost Center', 'Internal Activity Type', 'Dept. CC',
   'External Cost Center', 'External Activity Type',
   'RBS Skill Name', 'Hourly Cost'
 ];
+var COST_CENTER_LEVEL_COLS_ = ['Unit', 'Department', 'Group', 'Role', 'Name'];
 
 /**
  * Finance month store (budget + booking).
@@ -132,9 +158,13 @@ var BOOKING_HEADERS = FINANCE_MONTH_HEADERS.concat([
   'Transfer Type'
 ]).concat(MONTH_HEADERS_LONG.map(function (m) { return 'Auto_' + m; }));
 
-/** Access tab — User Name / Role / Scope / Scope Value / Source (+ optional User Email). */
+/**
+ * Access tab — matches Cap Plan UI columns.
+ * Legacy sheets with Scope / Scope Value are still readable.
+ */
 var ACCESS_HEADERS = [
-  'User Name', 'Role', 'Scope', 'Scope Value', 'Source', 'User Email'
+  'Access_ID', 'Role', 'User Name', 'Global', 'Program', 'Project', 'Unit', 'Department',
+  'User Email', 'Source'
 ];
 var DEFAULT_ADMIN_ACCESS_ID = 'access_admin_the_admin';
 var DEFAULT_ADMIN_USER_NAME = 'the admin';
@@ -306,6 +336,8 @@ function getMastersBundle_(registeredAs, forceRegistered) {
     meta: meta,
     access: access,
     costCenters: readCostCenters_(),
+    publicOverviewViews: readOverviewViews_(),
+    feedback: readFeedback_(),
     wave: 'masters'
   };
 }
@@ -318,7 +350,11 @@ function getPortfolioRowsBundle(registeredAs, forceRegistered) {
   var projects = readProjects_();
   var employees = readEmployees_();
   var rowRecords = readRowRecords_();
+  migrateYearSeriesSc_(rowRecords);
   var rows = assembleRows_(rowRecords, [], projects, employees);
+  var ensured = ensurePlaceholderAvailability_(rows, employees, readMeta_());
+  rows = ensured.rows;
+  employees = ensured.employees;
 
   var snapshotDates = listSnapshotDates_();
   var compareDate = defaultCompareSnapshotDate_(snapshotDates, settings.compareSnapshotDate);
@@ -345,7 +381,8 @@ function getPortfolioRowsBundle(registeredAs, forceRegistered) {
     compareSnapshotDate: compareDate,
     snapshotLabel: compareDate != null ? formatSnapshotLabel_(compareDate) : '',
     wave: 'portfolioRows',
-    yearsPending: true
+    yearsPending: true,
+    employees: employees
   };
 }
 
@@ -356,8 +393,12 @@ function getPortfolioYearsBundle(registeredAs, forceRegistered) {
   var projects = readProjects_();
   var employees = readEmployees_();
   var rowRecords = readRowRecords_();
+  migrateYearSeriesSc_(rowRecords);
   var yearRecords = readYearRecords_();
   var rows = assembleRows_(rowRecords, yearRecords, projects, employees);
+  var ensured = ensurePlaceholderAvailability_(rows, employees, readMeta_());
+  rows = ensured.rows;
+  employees = ensured.employees;
   syncAvailabilityTotals_(rows);
 
   var snapshotDates = listSnapshotDates_();
@@ -411,8 +452,12 @@ function getPortfolioBundle_(mastersHint) {
   var projects = (mastersHint && mastersHint.projects) || readProjects_();
   var employees = (mastersHint && mastersHint.employees) || readEmployees_();
   var rowRecords = readRowRecords_();
+  migrateYearSeriesSc_(rowRecords);
   var yearRecords = readYearRecords_();
   var rows = assembleRows_(rowRecords, yearRecords, projects, employees);
+  var ensured = ensurePlaceholderAvailability_(rows, employees, readMeta_());
+  rows = ensured.rows;
+  employees = ensured.employees;
   syncAvailabilityTotals_(rows);
 
   var snapshotDates = listSnapshotDates_();
@@ -440,7 +485,8 @@ function getPortfolioBundle_(mastersHint) {
     compareSnapshotDate: compareDate,
     snapshotLabel: compareDate != null ? formatSnapshotLabel_(compareDate) : '',
     wave: 'portfolio',
-    yearsPending: false
+    yearsPending: false,
+    employees: employees
   };
 }
 
@@ -465,9 +511,17 @@ function getFinanceBundle() {
 }
 
 function getFinanceBundle_() {
+  var budget = readFinanceRecords_(SHEETS.BUDGET, false).filter(function (r) {
+    return !!(r && r.manual);
+  });
+  var booking = readFinanceRecords_(SHEETS.BOOKING, true).filter(function (r) {
+    if (!r) return false;
+    if (r.manual) return true;
+    return String(r.transfer_type || '').trim() !== '';
+  });
   return {
-    budgetRecords: readFinanceRecords_(SHEETS.BUDGET, false),
-    bookingRecords: readFinanceRecords_(SHEETS.BOOKING, true),
+    budgetRecords: budget,
+    bookingRecords: booking,
     wave: 'finance'
   };
 }
@@ -554,13 +608,15 @@ function getIdentityOverlay(registeredAs) {
   };
 }
 
-/** Append a row to the external Logger spreadsheet (best-effort). */
+/** Append a row to the matching Activity Logger tab (Load / Notify / Save). */
 function logAppEvent_(event, userName, role, details) {
   try {
     var ss = SpreadsheetApp.openById(LOGGER_SHEET_ID);
-    var sh = ss.getSheetByName(LOGGER_TAB);
+    var ev = String(event || '').trim().toLowerCase();
+    var tabName = LOGGER_EVENT_TABS[ev] || LOGGER_TAB;
+    var sh = ss.getSheetByName(tabName);
     if (!sh) {
-      sh = ss.insertSheet(LOGGER_TAB);
+      sh = ss.insertSheet(tabName);
       sh.appendRow(LOGGER_HEADERS);
       sh.setFrozenRows(1);
     } else if (sh.getLastRow() < 1 || !String(sh.getRange(1, 1).getValue() || '').trim()) {
@@ -741,12 +797,18 @@ function sendCapPlanNotification(payload) {
   if (!columns.length && rows[0] && rows[0].columns) columns = rows[0].columns;
   if (!columns.length && rows[0] && rows[0].cells) columns = Object.keys(rows[0].cells);
   if (!columns.length) columns = ['Type', 'Project', 'Role', 'Name'];
+  // Row ID is rendered once as its own column — drop duplicates from payload columns.
+  columns = columns.filter(function (c) {
+    var s = String(c || '').trim().toLowerCase();
+    return s && s !== 'row id' && s !== 'row_id' && s !== 'id';
+  });
 
   var rowLines = rows.map(function (r, i) {
     var cells = r.cells || {};
-    var bits = columns.map(function (c) {
+    var rowId = String(r.id || r.rowId || '').trim();
+    var bits = ['Row ID=' + rowId].concat(columns.map(function (c) {
       return c + '=' + String(cells[c] != null ? cells[c] : '');
-    });
+    }));
     return (i + 1) + '. ' + bits.join(' | ');
   }).join('\n');
 
@@ -756,22 +818,32 @@ function sendCapPlanNotification(payload) {
       ' <' + String(r.email || '') + '>';
   }).join('\n');
 
+  var baseUrl = webAppBaseUrl_();
   var body =
     'Cap Plan notification\n' +
     'From: ' + sender + (payload.senderRole ? (' (' + payload.senderRole + ')') : '') + '\n\n' +
     (comment ? ('Comment:\n' + comment + '\n\n') : '') +
+    (baseUrl ? ('Open Cap Plan: ' + baseUrl + '\n') : '') +
+    'Tip: Copy/Paste Row ID to quickly filter in Cap Plan\n\n' +
     'Selected rows (' + rows.length + '):\n' + rowLines + '\n\n' +
     'Recipients:\n' + recipLines + '\n';
 
-  var htmlHead = columns.map(function (c) {
-    return '<th style="text-align:left;padding:4px 8px;border:1px solid #ddd;background:#f4f4f5;white-space:nowrap">' +
-      escHtml_(c) + '</th>';
-  }).join('') +
-    '<th style="text-align:left;padding:4px 8px;border:1px solid #ddd;background:#f4f4f5;white-space:nowrap">Link</th>';
+  var htmlHead =
+    '<th style="text-align:left;padding:4px 8px;border:1px solid #ddd;background:#f4f4f5;white-space:nowrap">Row ID</th>' +
+    columns.map(function (c) {
+      return '<th style="text-align:left;padding:4px 8px;border:1px solid #ddd;background:#f4f4f5;white-space:nowrap">' +
+        escHtml_(c) + '</th>';
+    }).join('');
 
   var htmlRows = rows.map(function (r) {
     var cells = r.cells || {};
     var colors = r.cellColors || {};
+    var rowId = String(r.id || r.rowId || '').trim();
+    // Break digit runs so Outlook/Gmail don't auto-link Row ID as a phone number.
+    var idTd = '<td style="padding:4px 8px;border:1px solid #ddd;white-space:nowrap;font-weight:700" ' +
+      'x-apple-data-detectors="false">' +
+      '<span style="color:inherit;text-decoration:none" x-apple-data-detectors="false">' +
+      escHtml_(antiAutolinkText_(rowId)) + '</span></td>';
     var tds = columns.map(function (c) {
       var color = String(colors[c] || '').trim();
       var style = 'padding:4px 8px;border:1px solid #ddd';
@@ -779,14 +851,7 @@ function sendCapPlanNotification(payload) {
       return '<td style="' + style + '">' +
         escHtml_(cells[c] != null ? cells[c] : '') + '</td>';
     }).join('');
-    var tab = String(r.tab || '').toLowerCase() === 'allocation' ? 'allocation'
-      : (r.is_availability ? 'allocation' : 'demand');
-    var link = rowDeepLink_(r.id || r.rowId, tab);
-    var linkTd = link
-      ? ('<td style="padding:4px 8px;border:1px solid #ddd;white-space:nowrap">' +
-        '<a href="' + escHtml_(link) + '" style="color:#2563eb;font-weight:600">Open in Cap Plan</a></td>')
-      : '<td style="padding:4px 8px;border:1px solid #ddd"></td>';
-    return '<tr>' + tds + linkTd + '</tr>';
+    return '<tr>' + idTd + tds + '</tr>';
   }).join('');
 
   var htmlRecip = recipients.map(function (r) {
@@ -795,25 +860,29 @@ function sendCapPlanNotification(payload) {
       ' &lt;' + escHtml_(r.email || '') + '&gt;</li>';
   }).join('');
 
-  var linkNote = webAppBaseUrl_()
-    ? '<p style="color:#52525b;font-size:12px">Each row includes an <b>Open in Cap Plan</b> link that jumps to that row after sign-in.</p>'
-    : '<p style="color:#b91c1c;font-size:12px">Deep links unavailable — redeploy the web app so the deployment URL is available.</p>';
+  var linkNote = baseUrl
+    ? '<p style="margin:0 0 6px 0;color:#18181b;font-size:14px;line-height:1.4">Open <a href="' +
+      escHtml_(baseUrl) +
+      '" style="color:#2563eb;font-weight:700;text-decoration:underline;font-size:14px">Cap Plan</a></p>' +
+      '<p style="margin:0 0 12px 0;color:#52525b;font-size:14px;line-height:1.4">' +
+      'Tip: Copy/Paste Row ID to quickly filter in Cap Plan</p>'
+    : '<p style="margin:0 0 12px 0;color:#b91c1c;font-size:14px">Cap Plan link unavailable — redeploy the web app so the deployment URL is available.</p>';
 
   var html =
     '<div style="font-family:Segoe UI,Arial,sans-serif;font-size:14px;color:#18181b">' +
-    '<p><b>Cap Plan notification</b> by ' + escHtml_(sender) +
+    '<p style="font-size:14px"><b>Cap Plan notification</b> by ' + escHtml_(sender) +
     (payload.senderRole ? (' (' + escHtml_(payload.senderRole) + ')') : '') + '</p>' +
     (comment
-      ? ('<p><b>Comment</b></p><p style="white-space:pre-wrap;background:#f4f4f5;padding:10px;border-radius:6px">' +
+      ? ('<p style="font-size:14px"><b>Comment</b></p><p style="white-space:pre-wrap;background:#f4f4f5;padding:10px;border-radius:6px;font-size:14px">' +
         escHtml_(comment) + '</p>')
       : '') +
-    '<p><b>Selected rows (' + rows.length + ')</b></p>' +
     linkNote +
+    '<p style="font-size:14px"><b>Selected rows (' + rows.length + ')</b></p>' +
     '<div style="overflow:auto;max-width:100%">' +
-    '<table style="border-collapse:collapse;width:100%;min-width:480px">' +
+    '<table style="border-collapse:collapse;width:100%;min-width:480px;font-size:14px">' +
     '<thead><tr>' + htmlHead + '</tr></thead><tbody>' + htmlRows + '</tbody></table>' +
     '</div>' +
-    '<p><b>Recipients</b></p><ul>' + htmlRecip + '</ul>' +
+    '<p style="font-size:14px"><b>Recipients</b></p><ul style="font-size:14px">' + htmlRecip + '</ul>' +
     '</div>';
 
   MailApp.sendEmail({
@@ -837,6 +906,11 @@ function escHtml_(s) {
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;');
+}
+
+/** Insert zero-width spaces so mail clients do not auto-link digit runs as phone numbers. */
+function antiAutolinkText_(s) {
+  return String(s == null ? '' : s).split('').join('\u200B');
 }
 
 /** Session + PropertiesService identity for Execute-as-Me web apps. */
@@ -1043,6 +1117,40 @@ function isKnownRegistrableUser_(name, knownUsers) {
  * }
  * Returns a light ack (no full bootstrap) so saves stay under ~10s.
  */
+function formatSaveSummary_(counts) {
+  counts = counts || {};
+  var parts = [];
+  function add(n, label) {
+    n = Number(n) || 0;
+    if (n > 0) parts.push(label + ' ' + n);
+  }
+  add(counts.projects, 'project/topic');
+  add(counts.employees, 'employee');
+  add(counts.data, 'data');
+  add(counts.dataYear, 'data_year');
+  add(counts.budget, 'budget');
+  add(counts.booking, 'booking');
+  add(counts.costCenters, 'cost center');
+  add(counts.feedback, 'feedback/bug/report');
+  add(counts.access, 'access');
+  return parts.length ? ('Saved · ' + parts.join(' · ')) : 'Saved';
+}
+
+function writeFeedbackUpdates_(list, actor) {
+  var n = 0;
+  (list || []).forEach(function (entry) {
+    if (!entry || entry.id == null || entry.id === '') return;
+    updateFeedback({
+      id: entry.id,
+      status: entry.status,
+      reply: entry.reply,
+      userName: actor
+    });
+    n++;
+  });
+  return n;
+}
+
 function savePortfolio(payload) {
   var t0 = Date.now();
   var settings = readSettings_();
@@ -1060,6 +1168,18 @@ function savePortfolio(payload) {
   var access = readAccess_();
   var projects = readProjects_();
   var employees = readEmployees_();
+  var employeesForLocks = employees.slice();
+  if (payload.employees && payload.employees.length) {
+    var empPos = {};
+    employeesForLocks.forEach(function (e, i) { empPos[String(e.id)] = i; });
+    payload.employees.forEach(function (e) {
+      var at = empPos[String(e.id)];
+      if (at == null) return;
+      employeesForLocks[at] = Object.assign({}, employeesForLocks[at], {
+        emp_writes_alloc: e.emp_writes_alloc
+      });
+    });
+  }
   var actorName = changedBy;
   // Re-resolve role from registered identity (do not trust client role alone)
   var resolvedRole = resolveRole_(actorName, access, role, projects);
@@ -1070,28 +1190,33 @@ function savePortfolio(payload) {
     if (role === 'Viewer') {
       return prev ? JSON.parse(JSON.stringify(prev)) : r;
     }
+    var asEmployee = !!(prev && leadActsAsEmployeeOnRow_(prev, actorName, employeesForLocks));
     if (role === 'Project Lead' && !rowInProjectLeadScopeServer_(r, actorName, role, access, projects)) {
+      if (asEmployee) return keepLeadEmployeeEdits_(JSON.parse(JSON.stringify(prev)), r, prev, months, employeesForLocks);
       return prev ? JSON.parse(JSON.stringify(prev)) : r;
     }
     if (role === 'People Lead' && !rowInPeopleLeadScopeServer_(r, actorName, access, employees)) {
+      if (asEmployee) return keepLeadEmployeeEdits_(JSON.parse(JSON.stringify(prev)), r, prev, months, employeesForLocks);
       return prev ? JSON.parse(JSON.stringify(prev)) : r;
     }
     if (role === 'People+Project Lead') {
       var inPL = rowInProjectLeadScopeServer_(r, actorName, role, access, projects);
       var inPeople = rowInPeopleLeadScopeServer_(r, actorName, access, employees);
       if (!inPL && !inPeople) {
+        if (asEmployee) return keepLeadEmployeeEdits_(JSON.parse(JSON.stringify(prev)), r, prev, months, employeesForLocks);
         return prev ? JSON.parse(JSON.stringify(prev)) : r;
       }
-      var locked = applyRoleLocksOnSave_(r, prev, role, months);
+      var locked = applyRoleLocksOnSave_(r, prev, role, months, employeesForLocks, actorName);
       if (!inPL && prev) {
         locked = applyOutOfProjectLeadLocks_(locked, prev, months);
       }
       if (!inPeople && prev) {
         locked = applyOutOfPeopleLeadLocks_(locked, prev, months);
       }
+      if (asEmployee) locked = keepLeadEmployeeEdits_(locked, r, prev, months, employeesForLocks);
       return locked;
     }
-    return applyRoleLocksOnSave_(r, prev, role, months);
+    return applyRoleLocksOnSave_(r, prev, role, months, employeesForLocks, actorName);
   });
 
   var deleted = payload.deletedIds || [];
@@ -1110,52 +1235,75 @@ function savePortfolio(payload) {
     settings = next;
   }
 
-  var masterStats = { projects: 0, employees: 0, access: 0, costCenters: 0, budget: 0, booking: 0 };
+  var want = payload.changedCounts || {};
+  function changedCount_(key, fallback) {
+    if (want[key] != null && want[key] !== '') return Number(want[key]) || 0;
+    return Number(fallback) || 0;
+  }
+  var masterStats = {
+    projects: 0, employees: 0, access: 0, costCenters: 0, budget: 0, booking: 0, feedback: 0
+  };
   if (payload.projects && role === 'Admin') {
     writeProjectsDelta_(payload.projects);
-    masterStats.projects = (payload.projects || []).length;
+    masterStats.projects = changedCount_('projects', (payload.projects || []).length);
   }
   if (payload.employees && (role === 'Admin' || role === 'People Lead' || role === 'People+Project Lead')) {
     var employeesToWrite = sanitizeEmployeesForRole_(payload.employees, employees, role, actorName, access);
     writeEmployeesList_(employeesToWrite);
-    masterStats.employees = (employeesToWrite || []).length;
+    masterStats.employees = changedCount_('employees', (employeesToWrite || []).length);
   }
-  if (payload.access && role === 'Admin') {
-    writeAccessList_(payload.access);
-    masterStats.access = (payload.access || []).length;
+  if (payload.access && (role === 'Admin' || role === 'People Lead' ||
+      role === 'Project Lead' || role === 'People+Project Lead')) {
+    var accessToWrite = sanitizeAccessForRole_(
+      payload.access, access, role, actorName, projects, employees);
+    writeAccessList_(accessToWrite);
+    masterStats.access = changedCount_('access', (accessToWrite || []).length);
   }
-  if (payload.costCenters && (role === 'Admin' || role === 'People Lead' || role === 'People+Project Lead')) {
+  if (payload.costCenters && role === 'Admin') {
     writeCostCenters_(payload.costCenters);
-    masterStats.costCenters = (payload.costCenters || []).length;
+    masterStats.costCenters = changedCount_('costCenters', (payload.costCenters || []).length);
   }
   // Budget: Project Lead / Admin; Booking: People Lead / Admin
+  // Manual overwrites only — delta upsert (no full sheet wipe of unrelated rows).
   if (payload.budgetRecords && (role === 'Admin' || role === 'Project Lead' || role === 'People+Project Lead')) {
-    writeFinanceRecords_(SHEETS.BUDGET, payload.budgetRecords, false);
-    masterStats.budget = (payload.budgetRecords || []).length;
+    if (payload.budgetDelta) upsertFinanceRecordsDelta_(SHEETS.BUDGET, payload.budgetRecords, false);
+    else writeFinanceRecords_(SHEETS.BUDGET, payload.budgetRecords, false);
+    masterStats.budget = changedCount_('budget', (payload.budgetRecords || []).length);
   }
   if (payload.bookingRecords && (role === 'Admin' || role === 'People Lead' || role === 'People+Project Lead')) {
-    writeFinanceRecords_(SHEETS.BOOKING, payload.bookingRecords, true);
-    masterStats.booking = (payload.bookingRecords || []).length;
+    if (payload.bookingDelta) upsertFinanceRecordsDelta_(SHEETS.BOOKING, payload.bookingRecords, true);
+    else writeFinanceRecords_(SHEETS.BOOKING, payload.bookingRecords, true);
+    masterStats.booking = changedCount_('booking', (payload.bookingRecords || []).length);
   }
+  if (payload.feedback && role === 'Admin') {
+    masterStats.feedback = writeFeedbackUpdates_(payload.feedback, changedBy);
+  }
+
+  ensurePlaceholderAvailability_(
+    assembleRows_(readRowRecords_(), [], readProjects_(), readEmployees_()),
+    readEmployees_(),
+    readMeta_()
+  );
 
   SpreadsheetApp.flush();
   var elapsedMs = Date.now() - t0;
-  var saveBits = [];
-  saveBits.push((stats.rowsUpserted || 0) + ' rows');
-  saveBits.push((stats.yearsUpserted || 0) + ' year-series');
-  if (stats.rowsDeleted) saveBits.push(stats.rowsDeleted + ' deleted');
-  if (masterStats.projects) saveBits.push(masterStats.projects + ' projects');
-  if (masterStats.employees) saveBits.push(masterStats.employees + ' employees');
-  if (masterStats.access) saveBits.push(masterStats.access + ' access');
-  if (masterStats.costCenters) saveBits.push(masterStats.costCenters + ' cost centers');
-  if (masterStats.budget) saveBits.push(masterStats.budget + ' budget');
-  if (masterStats.booking) saveBits.push(masterStats.booking + ' booking');
-  saveBits.push((elapsedMs / 1000).toFixed(1) + 's');
-  logAppEvent_('save', changedBy, role, saveBits.join(' · '));
+  var saveSummary = formatSaveSummary_({
+    projects: masterStats.projects,
+    employees: masterStats.employees,
+    data: (stats.rowsUpserted || 0) + (stats.rowsDeleted || 0),
+    dataYear: stats.yearsUpserted || 0,
+    budget: masterStats.budget,
+    booking: masterStats.booking,
+    costCenters: masterStats.costCenters,
+    feedback: masterStats.feedback,
+    access: masterStats.access
+  });
+  logAppEvent_('save', changedBy, role, saveSummary);
 
   return {
     ok: true,
     lightSave: true,
+    saveSummary: saveSummary,
     saveStats: Object.assign({}, stats, { masters: masterStats }),
     stampedAt: stats.stampedAt || null,
     stampedBy: stats.stampedBy || '',
@@ -1280,6 +1428,8 @@ function ensureSchema_() {
   ensureSheet_(SHEETS.COST_CENTERS, COST_CENTER_HEADERS);
   ensureSheet_(SHEETS.BUDGET, FINANCE_MONTH_HEADERS);
   ensureSheet_(SHEETS.BOOKING, BOOKING_HEADERS);
+  ensureSheet_(SHEETS.OVERVIEW_VIEWS, OVERVIEW_VIEW_HEADERS);
+  ensureSheet_(SHEETS.FEEDBACK, FEEDBACK_HEADERS);
 }
 
 /** Resolve canonical sheet name, falling back to legacy aliases. */
@@ -1314,9 +1464,18 @@ function ensureSheet_(name, headers) {
       existing.forEach(function (h) {
         if (h != null && String(h).trim() !== '') have[String(h).trim()] = true;
       });
-      var missing = headers.filter(function (h) { return !have[h]; });
-      if (missing.length) {
-        sh.getRange(1, existing.length + 1, 1, missing.length).setValues([missing]);
+      // Access / Cost Centers: replace header row when schema changed (data rewritten on next save).
+      var isAccessOrCc = name === SHEETS.ACCESS || name === sheetName_(SHEETS.ACCESS) ||
+        name === SHEETS.COST_CENTERS;
+      var forceReplace = isAccessOrCc && headers.some(function (h) { return !have[h]; });
+      if (forceReplace) {
+        sh.getRange(1, 1, 1, headers.length).setValues([headers]);
+        sh.setFrozenRows(1);
+      } else {
+        var missing = headers.filter(function (h) { return !have[h]; });
+        if (missing.length) {
+          sh.getRange(1, existing.length + 1, 1, missing.length).setValues([missing]);
+        }
       }
     }
   }
@@ -1408,6 +1567,103 @@ function seedIfEmpty_() {
   writeDelta_(rows, {}, {}, [], 'Seed');
 }
 
+var PLACEHOLDER_AVAIL_NAMES = ['NN', 'New Hire', 'Internal Employee', 'External Employee'];
+
+function placeholderAvailKind_(name) {
+  var s = String(name || '').trim();
+  if (!s) return '';
+  if (/^(nn|n\.n\.?)$/i.test(s)) return 'NN';
+  if (/^new\s*hire$/i.test(s)) return 'New Hire';
+  if (/^internal\s+employee$/i.test(s)) return 'Internal Employee';
+  if (/^external\s+employee$/i.test(s)) return 'External Employee';
+  return '';
+}
+
+function placeholderFteType_(name) {
+  if (name === 'External Employee' || name === 'NN') return 'External';
+  if (name === 'Internal Employee' || name === 'New Hire') return 'Internal';
+  return '';
+}
+
+/** One availability row per role for NN, New Hire, Internal Employee, External Employee. */
+function ensurePlaceholderAvailability_(rows, employees, meta) {
+  rows = rows || [];
+  employees = employees || [];
+  var roles = [];
+  var seenRole = {};
+  function addRole(role) {
+    var label = String(role || '').trim();
+    var key = label.toLowerCase();
+    if (!key || seenRole[key]) return;
+    seenRole[key] = 1;
+    roles.push(label);
+  }
+  employees.forEach(function (e) { addRole(e && e.role); });
+  rows.forEach(function (r) { addRole(r && r.role); });
+  ((meta && meta.Role) || []).forEach(addRole);
+
+  function empById(id) {
+    var want = String(id || '');
+    for (var i = 0; i < employees.length; i++) {
+      if (String(employees[i].id) === want) return employees[i];
+    }
+    return null;
+  }
+  function findEmp(role, kind) {
+    var key = String(role || '').trim().toLowerCase();
+    for (var i = 0; i < employees.length; i++) {
+      var e = employees[i];
+      if (String(e.role || '').trim().toLowerCase() !== key) continue;
+      if (placeholderAvailKind_(e.name) === kind) return e;
+    }
+    return null;
+  }
+  function hasAvail(role, kind) {
+    var key = String(role || '').trim().toLowerCase();
+    for (var i = 0; i < rows.length; i++) {
+      var r = rows[i];
+      if (!(r && (r.is_availability || r.source === SOURCES.AVAIL))) continue;
+      var linked = r.employee_id ? empById(r.employee_id) : null;
+      var roleLabel = r.role || (linked && linked.role) || '';
+      if (String(roleLabel).trim().toLowerCase() !== key) continue;
+      var name = r.name || (linked && linked.name) || '';
+      if (placeholderAvailKind_(name) === kind) return true;
+    }
+    return false;
+  }
+
+  var newEmps = [];
+  var newRows = [];
+  roles.forEach(function (role) {
+    PLACEHOLDER_AVAIL_NAMES.forEach(function (name) {
+      var emp = findEmp(role, name);
+      if (!emp) {
+        emp = {
+          id: 'E_' + Utilities.getUuid().replace(/-/g, '').slice(0, 8),
+          name: name,
+          role: role,
+          group_name: '',
+          department: '',
+          fte_type: placeholderFteType_(name),
+          people_location: '',
+          comments: '',
+          emp_writes_alloc: false
+        };
+        employees.push(emp);
+        newEmps.push(emp);
+      }
+      if (!hasAvail(role, name)) {
+        var row = newRow_(SOURCES.AVAIL, '', '', role, emp.id, name, 0);
+        rows.push(row);
+        newRows.push(row);
+      }
+    });
+  });
+  if (newEmps.length) writeEmployeesList_(employees);
+  if (newRows.length) writeDelta_(newRows, {}, {}, [], 'System');
+  return { employees: employees, rows: rows, created: newEmps.length + newRows.length };
+}
+
 function newRow_(source, projectId, topic, role, empId, name, sort) {
   return {
     id: Utilities.getUuid(),
@@ -1473,7 +1729,7 @@ function readSettings_() {
     userName: String(o.userName || ''),
     defaultRole: String(o.defaultRole || 'Admin'),
     colorDelta: Number(o.colorDelta) || 0,
-    yearFilters: String(o.yearFilters || '2026').split(',').map(function (s) { return s.trim(); }).filter(Boolean),
+    yearFilters: normalizeYearFilters_(o.yearFilters),
     colView: colView,
     showDiffs: o.showDiffs !== false && o.showDiffs !== 'FALSE' && o.showDiffs !== 0,
     compareLabel: String(o.compareLabel || ''),
@@ -1498,7 +1754,7 @@ function writeSettings_(s) {
     s.userName || '',
     s.defaultRole || 'Admin',
     Number(s.colorDelta) || 0,
-    (s.yearFilters || ['2026']).join(','),
+    normalizeYearFilters_(s.yearFilters).join(','),
     colView,
     s.showDiffs !== false,
     s.compareLabel || '',
@@ -1525,6 +1781,11 @@ function normalizeAccessScopeType_(t) {
   return 'global';
 }
 
+function truthyCell_(v) {
+  return v === true || v === 1 || String(v).toUpperCase() === 'TRUE' || String(v) === '1' ||
+    String(v).toLowerCase() === 'yes' || String(v).toLowerCase() === 'x';
+}
+
 function readAccess_() {
   var sh = sheet_(SHEETS.ACCESS);
   if (!sh) return [];
@@ -1532,16 +1793,33 @@ function readAccess_() {
   if (values.length < 2) return [];
   var h = values[0];
   var idx = headerIndex_(h);
-  // Databank: User Name, Role, Scope, Scope Value, Source
-  // Also accepts extended / legacy column names.
+  // New UI shape: Access_ID / Role / User Name / Global / Program / Project / Unit / Department
+  // Legacy: User Name / Role / Scope / Scope Value / Source / User Email
   return values.slice(1).filter(function (r) {
-    return r[0] || col_(r, idx, ['User Email', 'user', 'User Name', 'id', 'ID']);
+    return r[0] || col_(r, idx, ['User Email', 'user', 'User Name', 'Access_ID', 'id', 'ID']);
   }).map(function (r, i) {
     var userName = strCol_(r, idx, ['User Name', 'user']) || '';
     var userEmail = strCol_(r, idx, ['User Email']) || '';
     var roleType = normalizeAccessRoleType_(strCol_(r, idx, ['Role Type', 'Role', 'role']) || '');
     var scopeType = strCol_(r, idx, ['Scope Type', 'Scope', 'scope_type']) || '';
     var scopeValue = strCol_(r, idx, ['Scope Value', 'scope_value']) || '';
+    var flatGlobal = col_(r, idx, ['Global']);
+    var flatProgram = strCol_(r, idx, ['Program']);
+    var flatProject = strCol_(r, idx, ['Project']);
+    var flatUnit = strCol_(r, idx, ['Unit']);
+    var flatDept = strCol_(r, idx, ['Department']);
+    var hasFlatScope = idx.Global != null || idx.Program != null || idx.Project != null ||
+      idx.Unit != null || idx.Department != null;
+    if (hasFlatScope && !scopeType) {
+      if (truthyCell_(flatGlobal) || (!flatProgram && !flatProject && !flatUnit && !flatDept)) {
+        scopeType = 'global';
+        scopeValue = '';
+      } else if (flatProgram) { scopeType = 'program'; scopeValue = flatProgram; }
+      else if (flatProject) { scopeType = 'project'; scopeValue = flatProject; }
+      else if (flatUnit) { scopeType = 'unit'; scopeValue = flatUnit; }
+      else if (flatDept) { scopeType = 'department'; scopeValue = flatDept; }
+      else { scopeType = 'global'; scopeValue = ''; }
+    }
     if (!scopeType) {
       var proj = strCol_(r, idx, ['project']);
       var prog = strCol_(r, idx, ['programm', 'program']);
@@ -1554,7 +1832,7 @@ function readAccess_() {
       else { scopeType = 'global'; }
     }
     scopeType = normalizeAccessScopeType_(scopeType);
-    if (roleType === 'admin' || roleType === 'viewer') {
+    if (roleType === 'admin') {
       scopeType = 'global';
       scopeValue = '';
     }
@@ -1563,7 +1841,7 @@ function readAccess_() {
     var isAuto = isAutoRaw === true || isAutoRaw === 1 ||
       String(isAutoRaw).toUpperCase() === 'TRUE' || String(isAutoRaw) === '1' ||
       String(source).toLowerCase() === 'auto';
-    var id = strCol_(r, idx, ['id', 'ID']);
+    var id = strCol_(r, idx, ['Access_ID', 'id', 'ID']);
     if (!id) {
       id = 'access_' + String(userName + '_' + roleType + '_' + scopeType + '_' + scopeValue)
         .toLowerCase()
@@ -1604,7 +1882,7 @@ function saveAccess(records, registeredAs, forceRegistered) {
   var list = (records || []).map(function (r, i) {
     var roleType = normalizeAccessRoleType_(r.role_type || r.roleType || r.role || '');
     var scopeType = normalizeAccessScopeType_(r.scope_type || r.scopeType || 'global');
-    if (roleType === 'admin' || roleType === 'viewer') scopeType = 'global';
+    if (roleType === 'admin') scopeType = 'global';
     var scopeValue = scopeType === 'global'
       ? ''
       : String(r.scope_value != null ? r.scope_value : (r.scopeValue || '')).trim();
@@ -1646,85 +1924,278 @@ function saveAccess(records, registeredAs, forceRegistered) {
 }
 
 function writeAccessList_(list) {
+  ensureSheet_(sheetName_(SHEETS.ACCESS), ACCESS_HEADERS);
   var sh = sheet_(SHEETS.ACCESS);
   if (!sh) return;
-  // Keep existing header shape when already present; otherwise write canonical headers.
-  if (sh.getLastRow() < 1 || !sh.getRange(1, 1).getValue()) {
-    sh.getRange(1, 1, 1, ACCESS_HEADERS.length).setValues([ACCESS_HEADERS]);
-    sh.setFrozenRows(1);
-  }
-  var values = sh.getDataRange().getValues();
-  var headers = values[0];
-  var idx = headerIndex_(headers);
-  var width = Math.max(headers.length, ACCESS_HEADERS.length);
+  var lines = [[].concat(ACCESS_HEADERS)];
+  (list || []).forEach(function (r, i) {
+    if (!r || r.is_auto || r.isAuto) return;
+    var roleType = normalizeAccessRoleType_(r.role_type || r.roleType || r.role || '');
+    var scopeType = normalizeAccessScopeType_(r.scope_type || r.scopeType || 'global');
+    var scopeValue = r.scope_value != null ? r.scope_value : (r.scopeValue || '');
+    if (roleType === 'admin') {
+      scopeType = 'global';
+      scopeValue = '';
+    }
+    var isGlobal = scopeType === 'global';
+    lines.push([
+      String(r.id || ('access_' + (i + 1))),
+      roleType,
+      r.user_name || r.userName || '',
+      isGlobal ? true : '',
+      scopeType === 'program' ? scopeValue : '',
+      scopeType === 'project' ? scopeValue : '',
+      scopeType === 'unit' ? scopeValue : '',
+      scopeType === 'department' ? scopeValue : '',
+      r.userEmail || r.user_email || '',
+      r.source || 'Manual'
+    ]);
+  });
+  sh.clear();
+  sh.getRange(1, 1, lines.length, ACCESS_HEADERS.length).setValues(lines);
+  sh.setFrozenRows(1);
+}
 
-  function accessKey_(userName, roleType, scopeType, scopeValue) {
-    return [
-      String(userName || '').trim().toLowerCase(),
-      String(roleType || '').trim().toLowerCase(),
-      String(scopeType || '').trim().toLowerCase(),
-      String(scopeValue || '').trim().toLowerCase()
-    ].join('|');
+function accessRowIsProtected_(r) {
+  if (!r) return true;
+  var id = String(r.id || '');
+  var rt = normalizeAccessRoleType_(r.role_type || r.roleType || r.role || '');
+  var name = String(r.user_name || r.userName || '').trim().toLowerCase();
+  return id === DEFAULT_ADMIN_ACCESS_ID || rt === 'admin' || name === DEFAULT_ADMIN_USER_NAME;
+}
+
+function normalizeAccessRowForWrite_(r, sortOrder) {
+  var roleType = normalizeAccessRoleType_(r.role_type || r.roleType || r.role || '');
+  var scopeType = normalizeAccessScopeType_(r.scope_type || r.scopeType || 'global');
+  if (roleType === 'admin') scopeType = 'global';
+  var scopeValue = scopeType === 'global'
+    ? null
+    : String(r.scope_value != null ? r.scope_value : (r.scopeValue || '')).trim() || null;
+  return {
+    id: String(r.id || ('access_' + Utilities.getUuid().slice(0, 12))),
+    user_name: String(r.user_name || r.userName || '').trim(),
+    userEmail: String(r.userEmail || r.user_email || '').trim(),
+    role_type: roleType,
+    scope_type: scopeType,
+    scope_value: scopeValue,
+    is_auto: false,
+    source: 'Manual',
+    sort_order: Number(r.sort_order) || sortOrder || 1
+  };
+}
+
+/** Whether the actor may grant (or already holds) global scope for project/people leads. */
+function actorHasGlobalAccessGrant_(actorName, access, wantPeople, wantProject) {
+  var me = String(actorName || '').trim().toLowerCase();
+  if (!me) return false;
+  var hit = false;
+  (access || []).forEach(function (a) {
+    if (a.is_auto || a.isAuto) return;
+    var un = String(a.user_name || a.userName || '').trim().toLowerCase();
+    if (un !== me) return;
+    var st = normalizeAccessScopeType_(a.scope_type || a.scopeType || 'global');
+    if (st !== 'global') return;
+    var rt = normalizeRole_(a.role_type || a.roleType || a.role);
+    if (wantPeople && rt === 'People Lead') hit = true;
+    if (wantProject && rt === 'Project Lead') hit = true;
+  });
+  return hit;
+}
+
+function actorHasProgramGrant_(program, actorName, access, projects) {
+  var prog = String(program || '').trim();
+  if (!prog) return false;
+  var me = String(actorName || '').trim().toLowerCase();
+  if (!me) return false;
+  var programs = {};
+  var hasGlobal = false;
+  (access || []).forEach(function (a) {
+    if (a.is_auto || a.isAuto) return;
+    var rt = normalizeRole_(a.role_type || a.roleType || a.role);
+    if (rt !== 'Project Lead') return;
+    var un = String(a.user_name || a.userName || '').trim().toLowerCase();
+    if (un !== me) return;
+    var st = normalizeAccessScopeType_(a.scope_type || a.scopeType || 'global');
+    var sv = String(a.scope_value != null ? a.scope_value : (a.scopeValue || '')).trim();
+    if (st === 'global') hasGlobal = true;
+    else if (st === 'program' && sv) programs[sv.toLowerCase()] = true;
+  });
+  if (hasGlobal) return true;
+  if (programs[prog.toLowerCase()]) return true;
+  // Program allowed if actor leads any project in that program
+  return (projects || []).some(function (p) {
+    if (String(p.program || '').trim().toLowerCase() !== prog.toLowerCase()) return false;
+    return rowProjectInLeadScopeServer_(p.id, actorName, access, projects);
+  });
+}
+
+function actorHasPeopleAreaGrant_(scopeType, scopeValue, actorName, access, employees) {
+  var sv = String(scopeValue || '').trim().toLowerCase();
+  if (!sv) return false;
+  var me = String(actorName || '').trim().toLowerCase();
+  if (!me) return false;
+  var depts = {};
+  var units = {};
+  var hasGlobal = false;
+  var matched = false;
+  (access || []).forEach(function (a) {
+    if (a.is_auto || a.isAuto) return;
+    var rt = normalizeRole_(a.role_type || a.roleType || a.role);
+    if (rt !== 'People Lead') return;
+    var un = String(a.user_name || a.userName || '').trim().toLowerCase();
+    if (un !== me) return;
+    matched = true;
+    var st = normalizeAccessScopeType_(a.scope_type || a.scopeType || 'global');
+    var val = String(a.scope_value != null ? a.scope_value : (a.scopeValue || '')).trim();
+    if (st === 'global') hasGlobal = true;
+    else if (st === 'department' && val) depts[val.toLowerCase()] = true;
+    else if (st === 'unit' && val) units[val.toLowerCase()] = true;
+  });
+  // Own employee record always contributes dept/unit (mirrors client).
+  (employees || []).forEach(function (e) {
+    if (String(e.name || '').trim().toLowerCase() !== me) return;
+    matched = true;
+    employeeDeptUnitKeys_(e, e).forEach(function (k) {
+      depts[k] = true;
+      units[k] = true;
+    });
+  });
+  if (hasGlobal) return true;
+  if (!matched) return false;
+  if (scopeType === 'department') return !!depts[sv];
+  if (scopeType === 'unit') return !!units[sv];
+  return !!(depts[sv] || units[sv]);
+}
+
+/** True if actor may create/edit/delete this access grant row. */
+function actorCanGrantAccessRow_(row, role, actorName, access, projects, employees) {
+  if (!row || accessRowIsProtected_(row)) return false;
+  var rt = normalizeAccessRoleType_(row.role_type || row.roleType || row.role || '');
+  if (rt === 'admin' || rt === 'employee') return false;
+  var canPeople = role === 'People Lead' || role === 'People+Project Lead';
+  var canProject = role === 'Project Lead' || role === 'People+Project Lead';
+  if (rt === 'people_lead' && !canPeople) return false;
+  if (rt === 'project_lead' && !canProject) return false;
+  if (rt !== 'people_lead' && rt !== 'project_lead' && rt !== 'viewer') return false;
+
+  var st = normalizeAccessScopeType_(row.scope_type || row.scopeType || 'global');
+  var sv = String(row.scope_value != null ? row.scope_value : (row.scopeValue || '')).trim();
+
+  if (st === 'global') {
+    return actorHasGlobalAccessGrant_(actorName, access, canPeople, canProject);
+  }
+  if (st === 'project') {
+    if (rt === 'people_lead') return false;
+    if (!canProject && rt !== 'viewer') return false;
+    return rowProjectInLeadScopeServer_(sv, actorName, access, projects);
+  }
+  if (st === 'program') {
+    if (rt === 'people_lead') return false;
+    if (!canProject && rt !== 'viewer') return false;
+    return actorHasProgramGrant_(sv, actorName, access, projects);
+  }
+  if (st === 'department' || st === 'unit') {
+    if (rt === 'project_lead') return false;
+    if (!canPeople && rt !== 'viewer') return false;
+    return actorHasPeopleAreaGrant_(st, sv, actorName, access, employees);
+  }
+  return false;
+}
+
+/**
+ * Merge incoming access with sheet access under role limits.
+ * Admin: full replace (plus built-in admin row).
+ * Leads: only add/edit/delete rows they are allowed to grant; protect Admin rows.
+ */
+function sanitizeAccessForRole_(incoming, existing, role, actorName, projects, employees) {
+  var listIn = (incoming || []).filter(function (r) {
+    return r && !r.is_auto && !r.isAuto;
+  });
+  if (role === 'Admin') {
+    var adminOut = listIn.map(function (r, i) {
+      return normalizeAccessRowForWrite_(r, i + 1);
+    }).filter(function (r) { return r.user_name; });
+    var hasDefault = adminOut.some(function (r) {
+      return r.id === DEFAULT_ADMIN_ACCESS_ID ||
+        (String(r.user_name).toLowerCase() === DEFAULT_ADMIN_USER_NAME && r.role_type === 'admin');
+    });
+    if (!hasDefault) {
+      adminOut.unshift({
+        id: DEFAULT_ADMIN_ACCESS_ID,
+        user_name: DEFAULT_ADMIN_USER_NAME,
+        role_type: 'admin',
+        scope_type: 'global',
+        scope_value: null,
+        is_auto: false,
+        source: 'Manual',
+        sort_order: 0
+      });
+    }
+    return adminOut;
   }
 
-  var keyToRow = {};
-  for (var i = 1; i < values.length; i++) {
-    var u = strCol_(values[i], idx, ['User Name', 'user']) || String(values[i][0] || '');
-    var role = normalizeAccessRoleType_(strCol_(values[i], idx, ['Role Type', 'Role', 'role']) || '');
-    var scope = normalizeAccessScopeType_(strCol_(values[i], idx, ['Scope Type', 'Scope', 'scope_type']) || 'global');
-    var sval = strCol_(values[i], idx, ['Scope Value', 'scope_value']) || '';
-    keyToRow[accessKey_(u, role, scope, sval)] = i + 1;
-  }
+  var existingManual = (existing || []).filter(function (r) {
+    return r && !r.is_auto && !r.isAuto;
+  });
+  var incomingById = {};
+  listIn.forEach(function (r) {
+    if (r && r.id != null) incomingById[String(r.id)] = r;
+  });
 
+  var out = [];
   var seen = {};
-  var toAppend = [];
-  (list || []).forEach(function (r) {
-    var scopeType = r.scope_type || 'global';
-    var scopeValue = r.scope_value || '';
-    var source = 'Manual';
-    var line = new Array(width).fill('');
-    setAny_(line, idx, ['User Name', 'user'], r.user_name || '');
-    setAny_(line, idx, ['User Email'], r.userEmail || r.user_email || '');
-    setAny_(line, idx, ['Role Type', 'Role', 'role'], r.role_type || '');
-    setAny_(line, idx, ['Scope Type', 'Scope', 'scope_type'], scopeType);
-    setAny_(line, idx, ['Scope Value', 'scope_value'], scopeValue);
-    setAny_(line, idx, ['Source'], source);
-    setAny_(line, idx, ['id', 'ID'], r.id || '');
-    setAny_(line, idx, ['is_auto', 'Is Auto'], !!r.is_auto);
-    setAny_(line, idx, ['sort_order', 'Sort Order'], Number(r.sort_order) || 0);
-    // If sheet still has only positional ACCESS_HEADERS and setAny missed, fall back.
-    if (idx['User Name'] == null && idx.user == null && headers.length >= 5 && !line[0]) {
-      line = [r.user_name || '', r.role_type || '', scopeType, scopeValue, source];
+
+  existingManual.forEach(function (prev, i) {
+    var id = String(prev.id || '');
+    var inc = incomingById[id];
+    seen[id] = 1;
+
+    if (accessRowIsProtected_(prev)) {
+      out.push(normalizeAccessRowForWrite_(prev, prev.sort_order || (i + 1)));
+      return;
     }
-    var key = accessKey_(r.user_name, r.role_type, scopeType, scopeValue);
-    seen[key] = true;
-    var sheetRow = keyToRow[key];
-    if (sheetRow) {
-      if (!sheetRowEquals_(values[sheetRow - 1], line.slice(0, values[sheetRow - 1].length))) {
-        sh.getRange(sheetRow, 1, 1, line.length).setValues([line]);
-      }
+
+    var canTouchPrev = actorCanGrantAccessRow_(prev, role, actorName, existing, projects, employees);
+    if (!inc) {
+      // Deleted in UI — only drop if actor could grant that row.
+      if (!canTouchPrev) out.push(normalizeAccessRowForWrite_(prev, prev.sort_order || (i + 1)));
+      return;
+    }
+
+    var canTouchNew = actorCanGrantAccessRow_(inc, role, actorName, existing, projects, employees);
+    if (canTouchPrev && canTouchNew && String(inc.user_name || inc.userName || '').trim()) {
+      out.push(normalizeAccessRowForWrite_(inc, inc.sort_order || prev.sort_order || (i + 1)));
     } else {
-      toAppend.push(line);
+      out.push(normalizeAccessRowForWrite_(prev, prev.sort_order || (i + 1)));
     }
   });
 
-  var toDelete = [];
-  Object.keys(keyToRow).forEach(function (key) {
-    if (seen[key]) return;
-    // Preserve auto Access rows when the UI only sends manual rows
-    var sheetRow = keyToRow[key];
-    var isAuto = false;
-    if (sheetRow && values[sheetRow - 1]) {
-      var autoRaw = col_(values[sheetRow - 1], idx, ['Is Auto', 'is_auto']);
-      isAuto = autoRaw === true || autoRaw === 1 || String(autoRaw).toLowerCase() === 'true' ||
-        String(strCol_(values[sheetRow - 1], idx, ['Source']) || '').toLowerCase() === 'auto';
-    }
-    if (!isAuto) toDelete.push(sheetRow);
+  listIn.forEach(function (inc, i) {
+    var id = String(inc.id || '');
+    if (seen[id]) return;
+    if (accessRowIsProtected_(inc)) return;
+    if (!actorCanGrantAccessRow_(inc, role, actorName, existing, projects, employees)) return;
+    if (!String(inc.user_name || inc.userName || '').trim()) return;
+    out.push(normalizeAccessRowForWrite_(inc, inc.sort_order || (out.length + 1)));
   });
-  deleteSheetRows_(sh, toDelete);
-  if (toAppend.length) {
-    sh.getRange(sh.getLastRow() + 1, 1, toAppend.length, toAppend[0].length).setValues(toAppend);
+
+  var hasDefault2 = out.some(function (r) {
+    return r.id === DEFAULT_ADMIN_ACCESS_ID ||
+      (String(r.user_name).toLowerCase() === DEFAULT_ADMIN_USER_NAME && r.role_type === 'admin');
+  });
+  if (!hasDefault2) {
+    out.unshift({
+      id: DEFAULT_ADMIN_ACCESS_ID,
+      user_name: DEFAULT_ADMIN_USER_NAME,
+      role_type: 'admin',
+      scope_type: 'global',
+      scope_value: null,
+      is_auto: false,
+      source: 'Manual',
+      sort_order: 0
+    });
   }
+  return out;
 }
 
 /** Auto Project Lead access rows are managed outside Cap Plan — do not regenerate. */
@@ -1918,7 +2389,8 @@ function readEmployees_() {
       unit: roleUnitFromRole_(role),
       fte_type: strCol_(r, idx, ['FTE Type']) || '',
       people_location: strCol_(r, idx, ['People Location']) || '',
-      comments: strCol_(r, idx, ['Comments']) || ''
+      comments: strCol_(r, idx, ['Comments']) || '',
+      emp_writes_alloc: sheetFlag_(col_(r, idx, ['Emp writes Alloc']))
     };
   });
 }
@@ -1949,10 +2421,7 @@ function upsertEmployee(emp) {
 
 function writeEmployeesList_(list) {
   var sh = sheet_(SHEETS.EMPLOYEES);
-  if (sh.getLastRow() < 1 || !sh.getRange(1, 1).getValue()) {
-    sh.getRange(1, 1, 1, EMPLOYEE_HEADERS.length).setValues([EMPLOYEE_HEADERS]);
-    sh.setFrozenRows(1);
-  }
+  ensureEmployeesHeaderCols_(sh);
   var values = sh.getDataRange().getValues();
   var headers = values[0];
   var idx = headerIndex_(headers);
@@ -1976,6 +2445,7 @@ function writeEmployeesList_(list) {
     setAny_(line, idx, ['People Location'], e.people_location || '');
     setAny_(line, idx, ['Group'], e.group_name || '');
     setAny_(line, idx, ['FTE Type'], e.fte_type || '');
+    setAny_(line, idx, ['Emp writes Alloc'], sheetFlag_(e.emp_writes_alloc));
     if (idx['Employee_ID'] == null && idx.ID == null && !line[0]) {
       line = [id, e.role || '', e.name || '', e.comments || '',
         e.people_location || '', e.group_name || '', e.fte_type || ''];
@@ -2012,6 +2482,25 @@ function normalizeCostCenterLevel_(v) {
   return 'role';
 }
 
+function costCenterFlatFromLegacy_(level, levelValue) {
+  var out = { unit: '', department: '', group: '', role: '', name: '' };
+  var lvl = normalizeCostCenterLevel_(level);
+  var val = String(levelValue || '').trim();
+  if (val && out[lvl] !== undefined) out[lvl] = val;
+  return out;
+}
+
+function costCenterDecisiveFromFlat_(c) {
+  var order = ['unit', 'department', 'group', 'role', 'name'];
+  for (var i = 0; i < order.length; i++) {
+    var v = String(c[order[i]] || '').trim();
+    if (v) return { level: order[i], level_value: v };
+  }
+  var legacy = String(c.level_value || c.levelValue || '').trim();
+  if (legacy) return { level: normalizeCostCenterLevel_(c.level), level_value: legacy };
+  return { level: '', level_value: '' };
+}
+
 function readCostCenters_() {
   var sh = ss_().getSheetByName(SHEETS.COST_CENTERS);
   if (!sh || sh.getLastRow() < 2) return [];
@@ -2019,18 +2508,43 @@ function readCostCenters_() {
   var idx = headerIndex_(values[0]);
   return values.slice(1).filter(function (r) {
     return String(col_(r, idx, ['CC_ID', 'ID']) || '').trim() ||
-      String(col_(r, idx, ['Level Value']) || '').trim();
+      String(col_(r, idx, ['Level Value']) || '').trim() ||
+      String(col_(r, idx, ['Unit', 'Department', 'Group', 'Role', 'Name']) || '').trim() ||
+      String(col_(r, idx, ['Internal Cost Center']) || '').trim();
   }).map(function (r, i) {
+    var flat = {
+      unit: strCol_(r, idx, ['Unit']) || '',
+      department: strCol_(r, idx, ['Department']) || '',
+      group: strCol_(r, idx, ['Group']) || '',
+      role: strCol_(r, idx, ['Role']) || '',
+      name: strCol_(r, idx, ['Name']) || ''
+    };
+    var hasFlat = COST_CENTER_LEVEL_COLS_.some(function (h) { return idx[h] != null; });
+    var level = strCol_(r, idx, ['Level']) || '';
+    var levelValue = strCol_(r, idx, ['Level Value']) || '';
+    if (!hasFlat && (level || levelValue)) {
+      flat = costCenterFlatFromLegacy_(level, levelValue);
+    }
+    var decisive = costCenterDecisiveFromFlat_(Object.assign({
+      level: level, level_value: levelValue
+    }, flat));
     return {
       id: String(col_(r, idx, ['CC_ID', 'ID']) || ('CC_' + (i + 1))),
-      level: normalizeCostCenterLevel_(strCol_(r, idx, ['Level'])),
-      level_value: strCol_(r, idx, ['Level Value']) || '',
+      level: decisive.level || 'role',
+      level_value: decisive.level_value || '',
+      unit: flat.unit,
+      department: flat.department,
+      group: flat.group,
+      role: flat.role,
+      name: flat.name,
+      location: strCol_(r, idx, ['Location']) || '',
       internal_cost_center: strCol_(r, idx, ['Internal Cost Center']) || '',
       internal_activity_type: strCol_(r, idx, ['Internal Activity Type']) || '',
+      short_name: strCol_(r, idx, ['Dept. CC', 'Short Name', 'Dept CC']) || '',
       external_cost_center: strCol_(r, idx, ['External Cost Center']) || '',
       external_activity_type: strCol_(r, idx, ['External Activity Type']) || '',
       rbs_skill_name: strCol_(r, idx, ['RBS Skill Name']) || '',
-      hourly_cost: strCol_(r, idx, ['Hourly Cost']) || ''
+      hourly_cost: strCol_(r, idx, ['Hourly Cost', 'Hourly Rate']) || ''
     };
   });
 }
@@ -2042,14 +2556,34 @@ function writeCostCenters_(list) {
   (list || []).forEach(function (c, i) {
     if (!c) return;
     var id = String(c.id || ('CC_' + Utilities.getUuid().slice(0, 8)));
-    var levelValue = String(c.level_value || c.levelValue || '').trim();
-    if (!levelValue && !String(c.internal_cost_center || '').trim()) return;
+    var flat = {
+      unit: c.unit || '',
+      department: c.department || '',
+      group: c.group || '',
+      role: c.role || '',
+      name: c.name || ''
+    };
+    var decisive = costCenterDecisiveFromFlat_(Object.assign({}, flat, {
+      level: c.level, level_value: c.level_value || c.levelValue
+    }));
+    if (decisive.level && decisive.level_value && !flat[decisive.level]) {
+      flat[decisive.level] = decisive.level_value;
+    }
+    var hasAnyLevel = COST_CENTER_LEVEL_COLS_.some(function (h) {
+      return String(flat[h.toLowerCase()] || '').trim();
+    });
+    if (!hasAnyLevel && !String(c.internal_cost_center || '').trim()) return;
     lines.push([
       id,
-      normalizeCostCenterLevel_(c.level),
-      levelValue,
+      flat.unit || '',
+      flat.department || '',
+      flat.group || '',
+      flat.role || '',
+      flat.name || '',
+      c.location || '',
       c.internal_cost_center || c.internalCostCenter || '',
       c.internal_activity_type || c.internalActivityType || '',
+      c.short_name || c.shortName || '',
       c.external_cost_center || c.externalCostCenter || '',
       c.external_activity_type || c.externalActivityType || '',
       c.rbs_skill_name || c.rbsSkillName || '',
@@ -2134,6 +2668,33 @@ function readFinanceRecords_(sheetName, isBooking) {
   });
 }
 
+function financeRecordToLine_(rec, headers, isBooking) {
+  var kind = String(rec.kind || 'pair').toLowerCase() === 'row' ? 'row' : 'pair';
+  var year = Number(rec.year) || 0;
+  if (!year) return null;
+  var rowId = String(rec.row_id || rec.rowId || '').trim();
+  var cc = String(rec.cost_center || rec.costCenter || '').trim();
+  var pcc = String(rec.project_cost_center || rec.projectCostCenter || '').trim();
+  if (kind === 'row' && !rowId) return null;
+  if (kind === 'pair' && !cc && !pcc) return null;
+  var line = new Array(headers.length).fill('');
+  var idx = headerIndex_(headers);
+  setAny_(line, idx, ['Kind'], kind);
+  setAny_(line, idx, ['Row_ID', 'Row ID'], rowId);
+  setAny_(line, idx, ['Cost Center'], cc);
+  setAny_(line, idx, ['Activity Type'], rec.activity_type || rec.activityType || '');
+  setAny_(line, idx, ['Project Cost Center'], pcc);
+  setAny_(line, idx, ['Year'], year);
+  setAny_(line, idx, ['Manual'], rec.manual ? 'Y' : '');
+  writeMonthCellsToLine_(line, idx, rec.months || {}, '');
+  if (isBooking) {
+    setAny_(line, idx, ['Transfer Type'], normalizeTransferType_(rec.transfer_type || rec.transferType));
+    // Auto month columns are display-only — do not persist auto values.
+    writeMonthCellsToLine_(line, idx, {}, 'Auto_');
+  }
+  return line;
+}
+
 function writeFinanceRecords_(sheetName, list, isBooking) {
   var headers = isBooking ? BOOKING_HEADERS : FINANCE_MONTH_HEADERS;
   ensureSheet_(sheetName, headers);
@@ -2145,31 +2706,169 @@ function writeFinanceRecords_(sheetName, list, isBooking) {
     var key = financeRecordKey_(rec);
     if (seen[key]) return;
     seen[key] = true;
-    var kind = String(rec.kind || 'pair').toLowerCase() === 'row' ? 'row' : 'pair';
-    var year = Number(rec.year) || 0;
-    if (!year) return;
-    if (kind === 'row' && !String(rec.row_id || rec.rowId || '').trim()) return;
-    if (kind === 'pair' && !String(rec.cost_center || rec.costCenter || '').trim() &&
-        !String(rec.project_cost_center || rec.projectCostCenter || '').trim()) return;
-    var line = new Array(headers.length).fill('');
-    var idx = headerIndex_(headers);
-    setAny_(line, idx, ['Kind'], kind);
-    setAny_(line, idx, ['Row_ID', 'Row ID'], rec.row_id || rec.rowId || '');
-    setAny_(line, idx, ['Cost Center'], rec.cost_center || rec.costCenter || '');
-    setAny_(line, idx, ['Activity Type'], rec.activity_type || rec.activityType || '');
-    setAny_(line, idx, ['Project Cost Center'], rec.project_cost_center || rec.projectCostCenter || '');
-    setAny_(line, idx, ['Year'], year);
-    setAny_(line, idx, ['Manual'], rec.manual ? 'Y' : '');
-    writeMonthCellsToLine_(line, idx, rec.months || {}, '');
-    if (isBooking) {
-      setAny_(line, idx, ['Transfer Type'], normalizeTransferType_(rec.transfer_type || rec.transferType));
-      writeMonthCellsToLine_(line, idx, rec.auto_months || rec.autoMonths || {}, 'Auto_');
-    }
-    lines.push(line);
+    var line = financeRecordToLine_(rec, headers, isBooking);
+    if (line) lines.push(line);
   });
   sh.clear();
   sh.getRange(1, 1, lines.length, headers.length).setValues(lines);
   sh.setFrozenRows(1);
+}
+
+/**
+ * True delta upsert: update matching keys in place, append new keys.
+ * Never clears the sheet and never mass-deletes other rows (manuals or autos).
+ */
+function upsertFinanceRecordsDelta_(sheetName, incoming, isBooking) {
+  var headers = isBooking ? BOOKING_HEADERS : FINANCE_MONTH_HEADERS;
+  ensureSheet_(sheetName, headers);
+  var sh = ss_().getSheetByName(sheetName);
+  var lastRow = sh.getLastRow();
+  var lastCol = Math.max(sh.getLastColumn(), headers.length);
+  var width = headers.length;
+  var idx = headerIndex_(headers);
+
+  if (lastRow < 1) {
+    sh.getRange(1, 1, 1, width).setValues([headers]);
+    sh.setFrozenRows(1);
+    lastRow = 1;
+  }
+
+  // Index every existing data row by finance key so manuals (and any legacy
+  // autos) can be updated in place without wiping the tab.
+  var keyToSheetRow = {};
+  if (lastRow >= 2) {
+    var values = sh.getRange(2, 1, lastRow, lastCol).getValues();
+    for (var i = 0; i < values.length; i++) {
+      var r = values[i];
+      var kind = String(strCol_(r, idx, ['Kind']) || 'pair').toLowerCase() === 'row' ? 'row' : 'pair';
+      var rec = {
+        kind: kind,
+        row_id: strCol_(r, idx, ['Row_ID', 'Row ID']) || '',
+        cost_center: strCol_(r, idx, ['Cost Center']) || '',
+        activity_type: strCol_(r, idx, ['Activity Type']) || '',
+        project_cost_center: strCol_(r, idx, ['Project Cost Center']) || '',
+        year: Number(col_(r, idx, ['Year'])) || 0
+      };
+      var key = financeRecordKey_(rec);
+      if (!key || !rec.year) continue;
+      keyToSheetRow[key] = i + 2;
+    }
+  }
+
+  var updates = [];
+  var toAppend = [];
+  var touched = 0;
+  var seenIncoming = {};
+  (incoming || []).forEach(function (rec) {
+    if (!rec) return;
+    var key = financeRecordKey_(rec);
+    if (!key || seenIncoming[key]) return;
+    seenIncoming[key] = true;
+    var line = financeRecordToLine_(rec, headers, isBooking);
+    if (!line) return;
+    touched++;
+    var sheetRow = keyToSheetRow[key];
+    if (sheetRow) updates.push({ sheetRow: sheetRow, line: line });
+    else toAppend.push(line);
+  });
+
+  writeContiguousRowBlocks_(sh, updates, width);
+  if (toAppend.length) {
+    sh.getRange(sh.getLastRow() + 1, 1, toAppend.length, width).setValues(toAppend);
+  }
+  return touched;
+}
+
+function readOverviewViews_() {
+  var sh = ss_().getSheetByName(SHEETS.OVERVIEW_VIEWS);
+  if (!sh || sh.getLastRow() < 2) return [];
+  var values = sh.getDataRange().getValues();
+  var idx = headerIndex_(values[0]);
+  return values.slice(1).filter(function (r) {
+    return strCol_(r, idx, ['View_ID', 'Name']);
+  }).map(function (r) {
+    var payloadRaw = strCol_(r, idx, ['Payload']) || '{}';
+    var payload = {};
+    try { payload = JSON.parse(payloadRaw); } catch (e0) { payload = {}; }
+    return {
+      id: strCol_(r, idx, ['View_ID']) || '',
+      name: strCol_(r, idx, ['Name']) || '',
+      scope: String(strCol_(r, idx, ['Scope']) || 'public').toLowerCase() === 'personal' ? 'personal' : 'public',
+      owner: strCol_(r, idx, ['Owner']) || '',
+      viewMode: strCol_(r, idx, ['ViewMode']) || '',
+      overview: payload.overview || {},
+      globalFilters: payload.globalFilters || {},
+      savedAt: strCol_(r, idx, ['SavedAt']) || ''
+    };
+  }).filter(function (v) { return v.scope === 'public' && v.id && v.name; });
+}
+
+function writeOverviewViews_(list) {
+  ensureSheet_(SHEETS.OVERVIEW_VIEWS, OVERVIEW_VIEW_HEADERS);
+  var sh = ss_().getSheetByName(SHEETS.OVERVIEW_VIEWS);
+  var lines = [[].concat(OVERVIEW_VIEW_HEADERS)];
+  (list || []).forEach(function (v) {
+    if (!v || !v.id || !v.name) return;
+    if (String(v.scope || 'public').toLowerCase() !== 'public') return;
+    lines.push([
+      String(v.id),
+      String(v.name),
+      'public',
+      String(v.owner || ''),
+      String(v.viewMode || ''),
+      JSON.stringify({
+        overview: v.overview || {},
+        globalFilters: v.globalFilters || {}
+      }),
+      String(v.savedAt || '')
+    ]);
+  });
+  sh.clear();
+  sh.getRange(1, 1, lines.length, OVERVIEW_VIEW_HEADERS.length).setValues(lines);
+  sh.setFrozenRows(1);
+}
+
+/** Client: save or overwrite a public overview view. */
+function savePublicOverviewView(view, registeredAs) {
+  ensureSchema_();
+  var owner = String(registeredAs || '').trim();
+  if (!view || !view.name) throw new Error('View name required');
+  var list = readOverviewViews_();
+  var id = String(view.id || '').trim() ||
+    ('ovv_pub_' + Utilities.getUuid().slice(0, 10));
+  var name = String(view.name).trim();
+  var payload = {
+    id: id,
+    name: name,
+    scope: 'public',
+    owner: owner,
+    viewMode: String(view.viewMode || ''),
+    overview: view.overview || {},
+    globalFilters: view.globalFilters || {},
+    savedAt: Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy-MM-dd'T'HH:mm:ss")
+  };
+  var found = false;
+  for (var i = 0; i < list.length; i++) {
+    if (String(list[i].id) === id ||
+        String(list[i].name).toLowerCase() === name.toLowerCase()) {
+      list[i] = payload;
+      found = true;
+      break;
+    }
+  }
+  if (!found) list.push(payload);
+  writeOverviewViews_(list);
+  return { ok: true, view: payload, publicOverviewViews: list };
+}
+
+/** Client: delete a public overview view by id. */
+function deletePublicOverviewView(viewId, registeredAs) {
+  ensureSchema_();
+  var id = String(viewId || '').trim();
+  if (!id) throw new Error('View id required');
+  var list = readOverviewViews_().filter(function (v) { return String(v.id) !== id; });
+  writeOverviewViews_(list);
+  return { ok: true, publicOverviewViews: list };
 }
 
 /** Replace the full Employees master list (Admin / People Lead UI). */
@@ -2179,38 +2878,101 @@ function saveEmployees(employees, registeredAs, forceRegistered) {
   return getBootstrap(registeredAs || '', !!forceRegistered);
 }
 
-/** Admin-only delete of a Projects master row (+ related planning rows). */
+/** Prefix a master label once. Planning rows keep their ids and pick this up on join. */
+function deletedTag_(value) {
+  var s = String(value || '').trim();
+  if (!s) return 'deleted_';
+  if (s.toLowerCase().indexOf('deleted_') === 0) return s;
+  return 'deleted_' + s;
+}
+
+/**
+ * People Lead may soft-delete employees in their department/unit.
+ * Admin may soft-delete any employee.
+ */
+function actorCanSoftDeleteEmployee_(actorName, role, emp, access, employees) {
+  if (role === 'Admin') return true;
+  if (role !== 'People Lead' && role !== 'People+Project Lead') return false;
+  if (!emp) return false;
+  var me = String(actorName || '').trim().toLowerCase();
+  if (!me) return false;
+  if (String(emp.name || '').trim().toLowerCase() === me) return true;
+  var depts = {};
+  var units = {};
+  var hasGlobal = false;
+  var matched = false;
+  (access || []).forEach(function (a) {
+    var rt = normalizeRole_(a.roleType || a.role_type || a.role);
+    if (rt !== 'People Lead' && rt !== 'People+Project Lead') return;
+    var un = String(a.userName || a.user_name || '').trim().toLowerCase();
+    if (un !== me) return;
+    matched = true;
+    var st = normalizeAccessScopeType_(a.scopeType || a.scope_type || 'global');
+    var sv = String(a.scopeValue != null ? a.scopeValue : (a.scope_value || '')).trim();
+    if (st === 'global') hasGlobal = true;
+    else if (st === 'department' && sv) depts[sv.toLowerCase()] = true;
+    else if (st === 'unit' && sv) units[sv.toLowerCase()] = true;
+  });
+  (employees || []).forEach(function (e) {
+    if (String(e.name || '').trim().toLowerCase() !== me) return;
+    employeeDeptUnitKeys_(e, e).forEach(function (k) {
+      var key = String(k || '').trim().toLowerCase();
+      if (key) depts[key] = true;
+    });
+    matched = true;
+  });
+  if (hasGlobal) return true;
+  if (!matched) return false;
+  var keys = employeeDeptUnitKeys_(emp, emp);
+  return keys.some(function (k) {
+    var key = String(k || '').trim().toLowerCase();
+    return !!(key && (depts[key] || units[key]));
+  });
+}
+
+/** Admin: keep the project and prefix Project/Topic with deleted_. Planning rows stay. */
 function deleteProject(projectId, registeredAs, forceRegistered) {
   ensureSchema_();
   if (!projectId) throw new Error('Missing project id');
+  var actor = String(registeredAs || '').trim();
+  if (!actor) throw new Error('Registration required: identify yourself before deleting.');
+  var projects = readProjects_();
+  var access = readAccess_();
+  var role = resolveRole_(actor, access, 'Employee', projects);
+  if (role !== 'Admin') throw new Error('Admin only');
   var want = normalizeSheetId_(projectId);
-  var sh = sheet_(SHEETS.PROJECTS);
-  var values = sh.getDataRange().getValues();
-  if (values.length >= 2) {
-    var idx = headerIndex_(values[0]);
-    var toDelete = [];
-    for (var i = 1; i < values.length; i++) {
-      if (normalizeSheetId_(col_(values[i], idx, ['Project_ID', 'ID'])) === want) toDelete.push(i + 1);
-    }
-    deleteSheetRows_(sh, toDelete);
-  }
-
-  // Remove demand / timeline / allocation rows tied to this project.
-  var related = readRowRecords_().filter(function (r) {
-    return normalizeSheetId_(r.project_id) === want;
-  }).map(function (r) { return r.id; });
-  if (related.length) deleteRowIds_(related);
-
-  return getBootstrap(registeredAs || '', !!forceRegistered);
+  var found = null;
+  projects.forEach(function (p) {
+    if (normalizeSheetId_(p.id) === want) found = p;
+  });
+  if (!found) throw new Error('Project not found');
+  found.project_topic = deletedTag_(found.project_topic);
+  writeProjectsDelta_(projects);
+  return { ok: true, lightDelete: true, projectId: want, project_topic: found.project_topic };
 }
 
-/** Admin-only delete of an Employees master row. */
+/** Admin or People Lead: keep the employee and prefix Name with deleted_. Planning rows stay. */
 function deleteEmployee(employeeId, registeredAs, forceRegistered) {
   ensureSchema_();
   if (!employeeId) throw new Error('Missing employee id');
-  var list = readEmployees_().filter(function (e) { return e.id !== employeeId; });
-  writeEmployeesList_(list);
-  return getBootstrap(registeredAs || '', !!forceRegistered);
+  var actor = String(registeredAs || '').trim();
+  if (!actor) throw new Error('Registration required: identify yourself before deleting.');
+  var employees = readEmployees_();
+  var access = readAccess_();
+  var projects = readProjects_();
+  var role = resolveRole_(actor, access, 'Employee', projects);
+  var want = normalizeSheetId_(employeeId);
+  var found = null;
+  employees.forEach(function (e) {
+    if (normalizeSheetId_(e.id) === want) found = e;
+  });
+  if (!found) throw new Error('Employee not found');
+  if (!actorCanSoftDeleteEmployee_(actor, role, found, access, employees)) {
+    throw new Error('You can only delete employees in your department');
+  }
+  found.name = deletedTag_(found.name);
+  writeEmployeesList_(employees);
+  return { ok: true, lightDelete: true, employeeId: want, name: found.name };
 }
 
 function readMeta_() {
@@ -2227,12 +2989,141 @@ function readMeta_() {
   return out;
 }
 
+function readFeedback_() {
+  var sh = ss_().getSheetByName(SHEETS.FEEDBACK);
+  if (!sh || sh.getLastRow() < 2) return [];
+  var values = sh.getDataRange().getValues();
+  var idx = headerIndex_(values[0]);
+  return values.slice(1).filter(function (r) {
+    return String(col_(r, idx, ['Feedback_ID', 'ID']) || '').trim();
+  }).map(function (r) {
+    return {
+      id: String(col_(r, idx, ['Feedback_ID', 'ID'])),
+      user: strCol_(r, idx, ['User']) || '',
+      at: strCol_(r, idx, ['Date/Time']) || '',
+      type: strCol_(r, idx, ['Type']) || 'Feedback',
+      description: strCol_(r, idx, ['Description']) || '',
+      status: strCol_(r, idx, ['Status']) || 'New',
+      reply: strCol_(r, idx, ['Reply']) || '',
+      row_id: strCol_(r, idx, ['Row_ID']) || ''
+    };
+  });
+}
+
+function submitFeedback(entry) {
+  ensureSchema_();
+  entry = entry || {};
+  var sh = sheet_(SHEETS.FEEDBACK);
+  var width = Math.max(sh.getLastColumn(), FEEDBACK_HEADERS.length);
+  var headers = sh.getRange(1, 1, 1, width).getValues()[0];
+  if (!headers || !headers[0]) {
+    headers = FEEDBACK_HEADERS.slice();
+    sh.getRange(1, 1, 1, headers.length).setValues([headers]);
+    sh.setFrozenRows(1);
+    width = headers.length;
+  }
+  var idx = headerIndex_(headers);
+  var type = String(entry.type || 'Feedback');
+  if (FEEDBACK_TYPES.indexOf(type) < 0) type = 'Feedback';
+  var item = {
+    id: 'F_' + Utilities.getUuid().replace(/-/g, '').slice(0, 8),
+    user: String(entry.user || '').trim(),
+    at: Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm:ss'),
+    type: type,
+    description: String(entry.description || ''),
+    status: 'New',
+    reply: '',
+    row_id: String(entry.rowId || entry.row_id || '')
+  };
+  var line = new Array(width).fill('');
+  setAny_(line, idx, ['Feedback_ID', 'ID'], item.id);
+  setAny_(line, idx, ['User'], item.user);
+  setAny_(line, idx, ['Date/Time'], item.at);
+  setAny_(line, idx, ['Type'], item.type);
+  setAny_(line, idx, ['Description'], item.description);
+  setAny_(line, idx, ['Status'], item.status);
+  setAny_(line, idx, ['Reply'], item.reply);
+  setAny_(line, idx, ['Row_ID'], item.row_id);
+  sh.getRange(sh.getLastRow() + 1, 1, 1, line.length).setValues([line]);
+  return item;
+}
+
+function updateFeedback(entry) {
+  ensureSchema_();
+  entry = entry || {};
+  var actor = String(entry.userName || entry.user || '').trim();
+  var access = readAccess_();
+  var projects = readProjects_();
+  var role = resolveRole_(actor, access, 'Employee', projects);
+  if (role !== 'Admin') throw new Error('Only admins can update status and reply');
+  var list = readFeedback_();
+  var found = null;
+  list.forEach(function (r) {
+    if (String(r.id) === String(entry.id)) found = r;
+  });
+  if (!found) throw new Error('Feedback not found');
+  var status = String(entry.status || found.status || 'New');
+  if (FEEDBACK_STATUSES.indexOf(status) < 0) status = found.status || 'New';
+  found.status = status;
+  found.reply = entry.reply == null ? found.reply : String(entry.reply);
+  var sh = sheet_(SHEETS.FEEDBACK);
+  var width = Math.max(sh.getLastColumn(), FEEDBACK_HEADERS.length);
+  var headers = sh.getRange(1, 1, 1, width).getValues()[0];
+  var idx = headerIndex_(headers);
+  var idCol = firstIdx_(idx, ['Feedback_ID', 'ID']);
+  if (idCol == null || sh.getLastRow() < 2) return found;
+  var ids = sh.getRange(2, idCol + 1, sh.getLastRow() - 1, 1).getValues();
+  for (var i = 0; i < ids.length; i++) {
+    if (String(ids[i][0]) !== String(found.id)) continue;
+    var line = new Array(width).fill('');
+    setAny_(line, idx, ['Feedback_ID', 'ID'], found.id);
+    setAny_(line, idx, ['User'], found.user);
+    setAny_(line, idx, ['Date/Time'], found.at);
+    setAny_(line, idx, ['Type'], found.type);
+    setAny_(line, idx, ['Description'], found.description);
+    setAny_(line, idx, ['Status'], found.status);
+    setAny_(line, idx, ['Reply'], found.reply);
+    setAny_(line, idx, ['Row_ID'], found.row_id);
+    sh.getRange(i + 2, 1, 1, line.length).setValues([line]);
+    break;
+  }
+  return found;
+}
+
 /* ========== Row information + row_years ========== */
 
+function normalizeYearFilters_(years) {
+  var raw = [];
+  if (years == null || years === '') {
+    raw = ['2026'];
+  } else if (Object.prototype.toString.call(years) === '[object Array]') {
+    years.forEach(function (y) {
+      String(y == null ? '' : y).split(/[,;\s]+/).forEach(function (p) {
+        if (p) raw.push(p);
+      });
+    });
+  } else {
+    String(years).split(/[,;\s]+/).forEach(function (p) {
+      if (p) raw.push(p);
+    });
+  }
+  var out = [];
+  var seen = {};
+  raw.forEach(function (y) {
+    var n = parseInt(String(y).trim(), 10);
+    if (!n || n < 2026 || n > 2036) return;
+    var s = String(n);
+    if (seen[s]) return;
+    seen[s] = 1;
+    out.push(s);
+  });
+  if (!out.length) out = ['2026'];
+  out.sort(function (a, b) { return Number(a) - Number(b); });
+  return out;
+}
+
 function monthsFromSettings_(settings) {
-  var years = settings.yearFilters && settings.yearFilters.length
-    ? settings.yearFilters
-    : ['2026'];
+  var years = normalizeYearFilters_(settings && settings.yearFilters);
   var months = [];
   years.forEach(function (y) {
     for (var m = 1; m <= 12; m++) {
@@ -2242,8 +3133,10 @@ function monthsFromSettings_(settings) {
   return months;
 }
 
-function readRowRecords_() {
-  var sh = sheet_(SHEETS.DATA);
+function readRowRecords_(sheetOrName) {
+  var sh = !sheetOrName ? sheet_(SHEETS.DATA)
+    : (typeof sheetOrName === 'string' ? ss_().getSheetByName(sheetOrName) : sheetOrName);
+  if (!sh) return [];
   var values = sh.getDataRange().getValues();
   if (values.length < 2) return [];
   var h = values[0];
@@ -2310,15 +3203,36 @@ function assembleRows_(rowRecords, yearRecords, projects, employees) {
 
   var yearsByRow = {};
   (yearRecords || []).forEach(function (y) {
-    if (!yearsByRow[y.row_id]) yearsByRow[y.row_id] = [];
-    yearsByRow[y.row_id].push(y);
+    var norm = normalizeSheetId_(y.row_id);
+    var raw = String(y.row_id == null ? '' : y.row_id);
+    var key = norm || raw;
+    if (!key) return;
+    if (!yearsByRow[key]) yearsByRow[key] = [];
+    yearsByRow[key].push(y);
+    if (raw && raw !== key) yearsByRow[raw] = yearsByRow[key];
   });
 
   return rowRecords.map(function (r) {
     var project = r.project_id ? projectById[r.project_id] : null;
-    var alt = r.alternative_financing ? projectById[r.alternative_financing] : null;
+    // Alt. Financing is the project/topic name; still accept legacy Project_ID values.
+    var alt = null;
+    var altRaw = String(r.alternative_financing || '').trim();
+    if (altRaw) {
+      alt = projectById[altRaw] || null;
+      if (!alt) {
+        var altLc = altRaw.toLowerCase();
+        for (var ai = 0; ai < (projects || []).length; ai++) {
+          if (String(projects[ai].project_topic || '').trim().toLowerCase() === altLc) {
+            alt = projects[ai];
+            break;
+          }
+        }
+      }
+    }
+    var altTopic = alt ? alt.project_topic : (altRaw || null);
     var employee = r.employee_id ? employeeById[r.employee_id] : null;
-    var packed = flattenYearRecords_(yearsByRow[r.id] || [], r.source || SOURCES.DA);
+    var yKey = normalizeSheetId_(r.id) || String(r.id || '');
+    var packed = flattenYearRecords_(yearsByRow[yKey] || yearsByRow[String(r.id)] || [], r.source || SOURCES.DA);
     var source = r.source || SOURCES.DA;
     return {
       id: r.id,
@@ -2327,8 +3241,8 @@ function assembleRows_(rowRecords, yearRecords, projects, employees) {
       version: r.version || 'Cur',
       project_id: r.project_id,
       project_topic: project ? project.project_topic : null,
-      alternative_financing: r.alternative_financing,
-      alternative_financing_topic: alt ? alt.project_topic : null,
+      alternative_financing: altTopic,
+      alternative_financing_topic: altTopic,
       workpackage: r.workpackage,
       role: r.role || (employee ? employee.role : null),
       employee_id: r.employee_id,
@@ -3304,7 +4218,70 @@ function isEmployeeEditablePlaceholderName_(name) {
   if (/^(nn|n\.n\.?|tbd|open|vacant|\?+)$/i.test(s)) return true;
   if (/^external\s+employee$/i.test(s)) return true;
   if (/^internal\s+employee$/i.test(s)) return true;
+  if (/new\s*hire|onboard|starter|to\s*hire|open\s*req/i.test(s)) return true;
   return false;
+}
+
+function actorEmployeeRecord_(actorName, employees) {
+  var want = String(actorName || '').trim().toLowerCase();
+  if (!want) return null;
+  var hit = null;
+  (employees || []).forEach(function (e) {
+    if (String(e.name || '').trim().toLowerCase() === want) hit = e;
+  });
+  return hit;
+}
+
+function rowStaffName_(row, employees) {
+  var name = String((row && row.name) || '').trim();
+  if (name || !row || !row.employee_id) return name;
+  (employees || []).forEach(function (e) {
+    if (String(e.id) === String(row.employee_id)) name = String(e.name || '').trim();
+  });
+  return name;
+}
+
+/** People / Project Lead editing a row the way an Employee would: own name, or their role's placeholders. */
+function leadActsAsEmployeeOnRow_(row, actorName, employees) {
+  if (!row) return false;
+  if (row.is_header || row.source === SOURCES.HEADER) return false;
+  if (row.is_availability || row.source === SOURCES.AVAIL) return false;
+  var actor = actorEmployeeRecord_(actorName, employees);
+  if (!actor) return false;
+  var name = rowStaffName_(row, employees);
+  var mine = String(actor.name || '').trim().toLowerCase();
+  if (mine && name.toLowerCase() === mine) return true;
+  if (String(row.role || '').trim().toLowerCase() !== String(actor.role || '').trim().toLowerCase()) return false;
+  return isEmployeeEditablePlaceholderName_(name);
+}
+
+function copyMonthNum_(v) {
+  if (v == null || v === '') return null;
+  var n = Number(v);
+  return isNaN(n) ? null : n;
+}
+
+/** Keep Emp months, employee notes, and placeholder project fields on top of a locked row. */
+function keepLeadEmployeeEdits_(out, incoming, prev, months, employees) {
+  if (!out || !incoming || !prev) return out;
+  var name = rowStaffName_(prev, employees);
+  if (isEmployeeEditablePlaceholderName_(name)) {
+    out.project_id = incoming.project_id;
+    out.project_topic = incoming.project_topic;
+    out.workpackage = incoming.workpackage;
+  }
+  out.notes_employee = incoming.notes_employee;
+  var mirror = employeeWritesAlloc_(prev.employee_id || incoming.employee_id, employees);
+  (months || []).forEach(function (ym) {
+    var m = ym.length === 7 ? ym + '-01' : ym;
+    if (!out.months) out.months = {};
+    var cur = out.months[m] || out.months[ym] || { demand: null, allocation: null, employee: null, budget: null };
+    var next = (incoming.months && (incoming.months[m] || incoming.months[ym])) || {};
+    cur.employee = copyMonthNum_(next.employee);
+    if (mirror) cur.allocation = copyMonthNum_(next.allocation);
+    out.months[m] = cur;
+  });
+  return out;
 }
 
 function isFixedRoleStaffName_(name) {
@@ -3317,7 +4294,7 @@ function isFixedRoleStaffName_(name) {
   return true;
 }
 
-function applyRoleLocksOnSave_(row, prev, role, months) {
+function applyRoleLocksOnSave_(row, prev, role, months, employees, actorName) {
   if (!prev) return row;
   if (role === 'Viewer') return JSON.parse(JSON.stringify(prev));
   var out = JSON.parse(JSON.stringify(row));
@@ -3330,8 +4307,12 @@ function applyRoleLocksOnSave_(row, prev, role, months) {
 
   if (role === 'Employee') {
     var empName = String(prev.name || out.name || '').trim();
-    if (!isEmployeeEditablePlaceholderName_(empName)) {
-      // Named colleagues: Employees may not change project / notes / Emp months.
+    var mirrorAlloc = employeeWritesAlloc_(prev.employee_id || out.employee_id, employees);
+    var ownsRow = String(actorName || '').trim().toLowerCase() &&
+      String(actorName || '').trim().toLowerCase() === String(empName || '').trim().toLowerCase();
+    if (!isEmployeeEditablePlaceholderName_(empName) && !(mirrorAlloc && ownsRow)) {
+      // Named colleagues: Employees may not change project / notes / Emp months,
+      // unless this person is flagged to copy Emp months onto allocation.
       return JSON.parse(JSON.stringify(prev));
     }
     out.employee_id = prev.employee_id;
@@ -3381,15 +4362,17 @@ function applyRoleLocksOnSave_(row, prev, role, months) {
     } else {
       if (role === 'Project Lead') {
         cur.allocation = old.allocation;
-        cur.employee = old.employee; // PL never edits Emp month columns
+        cur.employee = old.employee;
       } else if (role === 'People Lead') {
         cur.demand = old.demand;
         cur.budget = old.budget;
       } else if (role === 'Employee') {
         cur.demand = old.demand;
-        cur.allocation = old.allocation;
         cur.budget = old.budget;
-        // Emp months allowed only for placeholder names (already gated above)
+        if (!employeeWritesAlloc_(out.employee_id || prev.employee_id, employees)) {
+          cur.allocation = old.allocation;
+        }
+        // Emp months allowed for placeholders, and for flagged employees.
       } else if (role === 'People+Project Lead') {
         // both demand and allocation allowed (further scoped upstream)
       }
@@ -3400,6 +4383,10 @@ function applyRoleLocksOnSave_(row, prev, role, months) {
     if (!out.months) out.months = {};
     out.months[m] = cur;
   });
+  if ((role === 'Project Lead' || role === 'People Lead' || role === 'People+Project Lead') &&
+      leadActsAsEmployeeOnRow_(prev, actorName, employees)) {
+    keepLeadEmployeeEdits_(out, row, prev, months, employees);
+  }
   return out;
 }
 
@@ -3408,6 +4395,35 @@ function applyRoleLocksOnSave_(row, prev, role, months) {
 function ix_(headers, name) {
   var i = headers.indexOf(name);
   return i < 0 ? -1 : i;
+}
+
+function sheetFlag_(v) {
+  if (v === true || v === 1) return true;
+  var s = String(v == null ? '' : v).trim().toLowerCase();
+  return s === 'true' || s === 'y' || s === 'yes' || s === '1';
+}
+
+function ensureEmployeesHeaderCols_(sh) {
+  if (sh.getLastRow() < 1 || !sh.getRange(1, 1).getValue()) {
+    sh.getRange(1, 1, 1, EMPLOYEE_HEADERS.length).setValues([EMPLOYEE_HEADERS]);
+    sh.setFrozenRows(1);
+    return;
+  }
+  var last = Math.max(sh.getLastColumn(), 1);
+  var headers = sh.getRange(1, 1, 1, last).getValues()[0].map(function (h) { return String(h || ''); });
+  var missing = EMPLOYEE_HEADERS.filter(function (h) { return headers.indexOf(h) < 0; });
+  if (!missing.length) return;
+  sh.getRange(1, last + 1, 1, missing.length).setValues([missing]);
+}
+
+function employeeWritesAlloc_(employeeId, employees) {
+  var id = String(employeeId || '');
+  if (!id) return false;
+  var hit = null;
+  (employees || []).forEach(function (e) {
+    if (String(e.id) === id) hit = e;
+  });
+  return !!(hit && sheetFlag_(hit.emp_writes_alloc));
 }
 
 function headerIndex_(headers) {
@@ -3559,8 +4575,63 @@ function dataTypeToSc_(dt) {
   if (s === DATA_TYPES.ALLOCATION) return 'Alc';
   if (s === DATA_TYPES.EMPLOYEE) return 'Emp';
   if (s === DATA_TYPES.BUDGET) return 'Bud';
-  if (s === DATA_TYPES.TIMELINE) return 'Tl';
+  if (s === DATA_TYPES.TIMELINE) return 'timeline';
+  if (s === DATA_TYPES.AVAILABILITY) return 'availability';
   return 'Dm';
+}
+
+/**
+ * Rewrite live data_years Sc for availability and timeline rows.
+ * Older workbooks stored both as Dm (timeline sometimes as Tl).
+ * Allocation / Emp / Bud series are left as they are.
+ */
+function migrateYearSeriesSc_(rowRecords) {
+  var sh = sheet_(SHEETS.YEARS);
+  var lastRow = sh.getLastRow();
+  if (lastRow < 2) return 0;
+  var lastCol = Math.max(sh.getLastColumn(), 1);
+  var headers = sh.getRange(1, 1, 1, lastCol).getValues()[0];
+  var idx = headerIndex_(headers);
+  var scCol = firstIdx_(idx, ['Sc', 'data_type', 'Source']);
+  var ridCol = firstIdx_(idx, ['Row_ID', 'R_ID', 'row_id']);
+  if (scCol == null || ridCol == null) return 0;
+  var yearCol = firstIdx_(idx, ['Year', 'Y', 'year']);
+  var verCol = firstIdx_(idx, ['Version', 'V']);
+  var mrCol = firstIdx_(idx, ['Monthrow_ID', 'MR_ID']);
+
+  var sourceById = {};
+  (rowRecords || readRowRecords_()).forEach(function (r) {
+    sourceById[normalizeSheetId_(r.id)] = r.source || '';
+  });
+
+  var numRows = lastRow - 1;
+  var scVals = sh.getRange(2, scCol + 1, numRows, 1).getValues();
+  var idVals = sh.getRange(2, ridCol + 1, numRows, 1).getValues();
+  var yearVals = yearCol != null ? sh.getRange(2, yearCol + 1, numRows, 1).getValues() : null;
+  var verVals = verCol != null ? sh.getRange(2, verCol + 1, numRows, 1).getValues() : null;
+  var mrVals = mrCol != null ? sh.getRange(2, mrCol + 1, numRows, 1).getValues() : null;
+  var changed = 0;
+  for (var i = 0; i < scVals.length; i++) {
+    var src = sourceById[normalizeSheetId_(idVals[i][0])] || '';
+    var dt = normalizeDataType_(scVals[i][0]);
+    var next = '';
+    if (src === SOURCES.AVAIL && (dt === DATA_TYPES.DEMAND || dt === DATA_TYPES.AVAILABILITY)) {
+      next = 'availability';
+    } else if (src === SOURCES.HEADER && (dt === DATA_TYPES.DEMAND || dt === DATA_TYPES.TIMELINE)) {
+      next = 'timeline';
+    }
+    if (!next || String(scVals[i][0] == null ? '' : scVals[i][0]).trim().toLowerCase() === next) continue;
+    scVals[i][0] = next;
+    if (mrVals && yearVals) {
+      var ver = verVals ? String(verVals[i][0] || 'Cur') : 'Cur';
+      mrVals[i][0] = monthrowCompositeId_(idVals[i][0], yearVals[i][0], next, ver);
+    }
+    changed++;
+  }
+  if (!changed) return 0;
+  sh.getRange(2, scCol + 1, numRows, 1).setValues(scVals);
+  if (mrVals && mrCol != null) sh.getRange(2, mrCol + 1, numRows, 1).setValues(mrVals);
+  return changed;
 }
 
 function normalizeMonth_(m) {
